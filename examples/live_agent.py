@@ -20,6 +20,7 @@ Important:
 from __future__ import annotations
 
 import argparse
+import json
 import asyncio
 import queue
 import re
@@ -178,7 +179,7 @@ class LiveVoiceAgent:
         print("\nLoading adapters...")
         self._stt = WhisperSTT.from_config()
         self._llm = QwenLLM.from_config()
-        self._tts = BreezeTTS.from_config(mode="http")
+        self._tts = BreezeTTS.from_config(mode="websocket")
         print("  Adapters loaded OK")
 
     # ------------------------------------------------------------------
@@ -210,164 +211,99 @@ class LiveVoiceAgent:
                 pass
 
     # ------------------------------------------------------------------
-    # Streaming Qwen -> sentence queue -> Breeze
+    # Persistent Breeze streaming
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_tts_chunks(
-        buffer: str,
-        force: bool = False,
-    ) -> tuple[list[str], str]:
-        """Extract complete speech-sized chunks from streamed LLM text."""
-        chunks: list[str] = []
-        text = buffer
-
-        sentence_re = re.compile(
-            r"(.+?[.!?。！？]+(?:[\"'”’)]*)"
-            r"(?=\s+|$))",
-            re.DOTALL,
-        )
-
-        while True:
-            match = sentence_re.match(text)
-            if not match:
-                break
-
-            chunk = match.group(1).strip()
-            if chunk:
-                chunks.append(chunk)
-
-            text = text[match.end():].lstrip()
-
-        # Avoid waiting indefinitely for punctuation.
-        max_chars = 120
-        if len(text) >= max_chars:
-            cut = text.rfind(" ", 0, max_chars + 1)
-            if cut >= 40:
-                chunks.append(text[:cut].strip())
-                text = text[cut:].lstrip()
-
-        if force and text.strip():
-            chunks.append(text.strip())
-            text = ""
-
-        return chunks, text
-
-    async def _tts_synth_worker(
+    async def _breeze_receiver(
         self,
-        tts_queue: asyncio.Queue[str | None],
-        audio_queue: asyncio.Queue[tuple[int, object] | None],
+        session,
+        audio_queue: asyncio.Queue[bytes | None],
     ) -> None:
-        """Synthesize sentences sequentially, independent of playback."""
-        sequence = 0
-
+        """Receive Breeze PCM continuously until the current turn is done."""
         while True:
-            chunk = await tts_queue.get()
+            message = await session.receive()
+
+            if isinstance(message, bytes):
+                if message:
+                    await audio_queue.put(message)
+                continue
+
             try:
-                if chunk is None:
-                    return
-
-                sequence += 1
-                index = sequence
-                self._log(f'TTS synth #{index} start: "{chunk[:120]}"')
-                started = time.perf_counter()
-
-                try:
-                    # Keep the known-good Breeze one-shot synthesis API for
-                    # this step. The important change is that playback is no
-                    # longer inside this worker.
-                    result = await asyncio.to_thread(
-                        self._tts.synthesize,
-                        chunk,
-                    )
-
-                    self._log(
-                        f"TTS synth #{index} done: "
-                        f"{result.duration_secs:.2f}s "
-                        f"({time.perf_counter() - started:.2f}s wall)"
-                    )
-
-                    await audio_queue.put((index, result))
-
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._log(
-                        f"TTS synth #{index} error: {exc}",
-                        "ERROR",
-                    )
-
-            finally:
-                tts_queue.task_done()
-
-    async def _playback_worker(
-        self,
-        audio_queue: asyncio.Queue[tuple[int, object] | None],
-    ) -> None:
-        """Play completed TTS sentences in strict sequence order."""
-        expected = 1
-        pending: dict[int, object] = {}
-
-        while True:
-            item = await audio_queue.get()
-            try:
-                if item is None:
-                    return
-
-                index, result = item
-                pending[index] = result
-
-                while expected in pending:
-                    current = pending.pop(expected)
-
-                    if self._no_output:
-                        self._log(
-                            f"Output disabled for TTS chunk #{expected}"
-                        )
-                    else:
-                        audio_out = (
-                            np.frombuffer(
-                                current.pcm,
-                                dtype=np.int16,
-                            )
-                            .astype(np.float32)
-                            / 32768.0
-                        )
-
-                        self._log(
-                            f"Playing TTS chunk #{expected}..."
-                        )
-
-                        await asyncio.to_thread(
-                            sd.play,
-                            audio_out,
-                            current.sample_rate,
-                        )
-                        await asyncio.to_thread(sd.wait)
-
-                        self._log(
-                            f"Playback chunk #{expected} complete"
-                        )
-
-                    expected += 1
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
+                data = json.loads(message)
+            except json.JSONDecodeError:
                 self._log(
-                    f"Playback error: {exc}",
-                    "ERROR",
+                    f"Unexpected Breeze message: {message!r}",
+                    "WARN",
                 )
-            finally:
-                audio_queue.task_done()
+                continue
+
+            kind = data.get("type")
+
+            if kind == "done":
+                self._log("Breeze turn complete")
+                return
+
+            if kind == "error":
+                raise RuntimeError(
+                    data.get("message", "Breeze WebSocket error")
+                )
+
+            # ready / started / speaking / queued are informational.
+
+    async def _pcm_playback_worker(
+        self,
+        audio_queue: asyncio.Queue[bytes | None],
+    ) -> None:
+        """Play all Breeze PCM through one continuous output stream."""
+        if self._no_output:
+            while True:
+                pcm = await audio_queue.get()
+                try:
+                    if pcm is None:
+                        return
+                finally:
+                    audio_queue.task_done()
+
+        stream: sd.RawOutputStream | None = None
+
+        try:
+            while True:
+                pcm = await audio_queue.get()
+                try:
+                    if pcm is None:
+                        return
+
+                    if stream is None:
+                        stream = sd.RawOutputStream(
+                            device=None,
+                            samplerate=24000,
+                            channels=1,
+                            dtype="int16",
+                            blocksize=0,
+                        )
+                        stream.start()
+                        self._log("Streaming audio output ready")
+
+                    await asyncio.to_thread(
+                        stream.write,
+                        pcm,
+                    )
+                finally:
+                    audio_queue.task_done()
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
-    # STT -> LLM -> TTS
+    # STT -> streaming Qwen -> persistent Breeze -> speaker
     # ------------------------------------------------------------------
 
     async def _process_turn(self, audio: np.ndarray) -> None:
         """Process one complete speech turn."""
-
         audio_16k = resample_to_16k(audio, self._capture_rate)
         duration = len(audio_16k) / TARGET_SAMPLE_RATE
 
@@ -376,14 +312,11 @@ class LiveVoiceAgent:
             return
 
         rms, peak = audio_level(audio_16k)
-
         self._log(
             f"Transcribing {duration:.2f}s "
             f"(RMS={rms:.4f}, peak={peak:.4f})..."
         )
 
-        # A very low signal usually means the selected Windows default
-        # microphone is muted/incorrect, so avoid wasting an STT request.
         if peak < 0.003 or rms < 0.0005:
             self._log(
                 "Audio level is extremely low; ignoring segment. "
@@ -392,26 +325,23 @@ class LiveVoiceAgent:
             )
             return
 
-        # Make sure Whisper always receives contiguous float32 PCM.
         audio_16k = np.ascontiguousarray(audio_16k, dtype=np.float32)
 
         # ---------------- STT ----------------
         stt_start = time.perf_counter()
-
         try:
             stt_result = await asyncio.to_thread(
                 self._stt.transcribe,
                 audio_16k,
                 TARGET_SAMPLE_RATE,
             )
-
             transcribed = (stt_result.text or "").strip()
-            stt_time = time.perf_counter() - stt_start
-
             self._log(
-                f'STT: "{transcribed}" ({stt_time:.2f}s)'
+                f'STT: "{transcribed}" '
+                f"({time.perf_counter() - stt_start:.2f}s)"
             )
-
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._log(f"STT error: {exc}", "ERROR")
             return
@@ -421,113 +351,101 @@ class LiveVoiceAgent:
             return
 
         if transcribed.upper() == "[BLANK_AUDIO]":
-            self._log(
-                "Whisper returned BLANK_AUDIO despite VAD detecting speech. "
-                "Audio diagnostics above can be used to verify the mic signal.",
-                "WARN",
-            )
+            self._log("Whisper returned BLANK_AUDIO", "WARN")
             return
 
-        # ---------------- STREAMING LLM + OVERLAPPED TTS ----------------
+        # ---------------- Qwen + Breeze concurrently ----------------
         self._log("Generating response (streaming)...")
         llm_start = time.perf_counter()
         first_text_at: float | None = None
         response_parts: list[str] = []
-        text_buffer = ""
 
-        # Two independent stages:
-        #
-        #   Qwen -> sentence queue -> Breeze synthesis -> audio queue
-        #                                                     -> playback
-        #
-        # This means sentence N+1 can be synthesized while sentence N is
-        # playing. Playback never blocks Breeze synthesis anymore.
-        tts_queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4)
-        audio_queue: asyncio.Queue[tuple[int, object] | None] = asyncio.Queue(
-            maxsize=8
+        audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=128
         )
 
-        synth_task = asyncio.create_task(
-            self._tts_synth_worker(tts_queue, audio_queue),
-            name="tts-synthesis-worker",
-        )
         playback_task = asyncio.create_task(
-            self._playback_worker(audio_queue),
-            name="tts-playback-worker",
+            self._pcm_playback_worker(audio_queue),
+            name="breeze-pcm-playback",
         )
 
         try:
-            async for token in self._llm.chat_stream(
-                transcribed,
-                system=self._system,
-                options=ChatOptions(max_tokens=150),
-            ):
-                if not token:
-                    continue
-
-                if first_text_at is None:
-                    first_text_at = time.perf_counter()
-                    self._log(
-                        f"LLM first text: "
-                        f"{first_text_at - llm_start:.2f}s"
-                    )
-
-                response_parts.append(token)
-                text_buffer += token
-
-                chunks, text_buffer = self._extract_tts_chunks(text_buffer)
-
-                for chunk in chunks:
-                    self._log(
-                        f"Queueing TTS sentence: {chunk[:120]}"
-                    )
-                    await tts_queue.put(chunk)
-
-            chunks, text_buffer = self._extract_tts_chunks(
-                text_buffer,
-                force=True,
-            )
-
-            for chunk in chunks:
-                self._log(
-                    f"Queueing final TTS sentence: {chunk[:120]}"
+            async with self._tts.persistent_session() as breeze:
+                receiver_task = asyncio.create_task(
+                    self._breeze_receiver(
+                        breeze,
+                        audio_queue,
+                    ),
+                    name="breeze-pcm-receiver",
                 )
-                await tts_queue.put(chunk)
 
-            response = "".join(response_parts).strip()
+                try:
+                    # Every normal Qwen content fragment goes into the SAME
+                    # Breeze session. There is no new request per sentence.
+                    async for token in self._llm.chat_stream(
+                        transcribed,
+                        system=self._system,
+                        options=ChatOptions(max_tokens=150),
+                    ):
+                        if not token:
+                            continue
 
-            self._log(
-                f"LLM: {response[:160].replace(chr(10), ' ')}... "
-                f"({time.perf_counter() - llm_start:.2f}s)"
-            )
+                        if first_text_at is None:
+                            first_text_at = time.perf_counter()
+                            self._log(
+                                f"LLM first text: "
+                                f"{first_text_at - llm_start:.2f}s"
+                            )
 
-            if not response:
-                self._log("Empty LLM response", "WARN")
-                return
+                        response_parts.append(token)
+                        await breeze.send_text(token)
 
-            # All Qwen sentences have been submitted. Let Breeze finish
-            # synthesizing and let the playback worker drain them in order.
-            await tts_queue.join()
-            await audio_queue.join()
+                    response = "".join(response_parts).strip()
+
+                    self._log(
+                        f"LLM: {response[:160].replace(chr(10), ' ')}... "
+                        f"({time.perf_counter() - llm_start:.2f}s)"
+                    )
+
+                    if not response:
+                        self._log("Empty LLM response", "WARN")
+                        return
+
+                    # Flush remaining Breeze text and wait for all PCM.
+                    await breeze.end()
+                    await receiver_task
+
+                    # Receiver has handed off all PCM; playback consumes it
+                    # through the same stream, eliminating per-sentence
+                    # open/close/play gaps.
+                    await audio_queue.join()
+
+                except asyncio.CancelledError:
+                    receiver_task.cancel()
+                    await asyncio.gather(
+                        receiver_task,
+                        return_exceptions=True,
+                    )
+                    raise
+                except Exception:
+                    if not receiver_task.done():
+                        receiver_task.cancel()
+                        await asyncio.gather(
+                            receiver_task,
+                            return_exceptions=True,
+                        )
+                    raise
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._log(
-                f"LLM/TTS pipeline error: {exc}",
+                f"LLM/Breeze streaming error: {exc}",
                 "ERROR",
             )
         finally:
-            # Stop synthesis worker only after all queued text is synthesized.
-            if not synth_task.done():
-                await tts_queue.put(None)
+            await audio_queue.join()
 
-            await asyncio.gather(
-                synth_task,
-                return_exceptions=True,
-            )
-
-            # Then stop playback after every synthesized result has played.
             if not playback_task.done():
                 await audio_queue.put(None)
 
@@ -535,6 +453,10 @@ class LiveVoiceAgent:
                 playback_task,
                 return_exceptions=True,
             )
+
+    # ------------------------------------------------------------------
+    # Audio/VAD loop
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Audio/VAD loop
