@@ -45,6 +45,23 @@ TARGET_SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_MS = 32
 
+# ---------------------------------------------------------------------------
+# Streaming / latency tuning
+# ---------------------------------------------------------------------------
+
+# How much generated PCM to pre-buffer before speaker playback starts.
+# Lower = less initial latency, higher = more protection from TTS underflow.
+PLAYBACK_START_BUFFER_MS = 1000
+
+# Size of each speaker write. 80 ms is a reasonable balance between smooth
+# playback and responsiveness.
+PLAYBACK_WRITE_CHUNK_MS = 80
+
+# Qwen text is accumulated until we have a complete word and enough useful
+# text to send to Breeze. Never deliberately cut inside a word.
+BREEZE_TEXT_MIN_CHARS = 40
+BREEZE_TEXT_MAX_CHARS = 60
+
 
 # ---------------------------------------------------------------------------
 # Audio helpers
@@ -254,7 +271,14 @@ class LiveVoiceAgent:
         self,
         audio_queue: asyncio.Queue[bytes | None],
     ) -> None:
-        """Play all Breeze PCM through one continuous output stream."""
+        """Play Breeze PCM with a small jitter buffer to prevent underflow.
+
+        Breeze can temporarily pause between PCM packets while generating the
+        next audio frames. Starting playback immediately on the first packet
+        makes those pauses audible as clipped/choppy words. We therefore
+        accumulate a short startup buffer, then keep a continuous output
+        stream running while the receiver continues filling the queue.
+        """
         if self._no_output:
             while True:
                 pcm = await audio_queue.get()
@@ -264,16 +288,66 @@ class LiveVoiceAgent:
                 finally:
                     audio_queue.task_done()
 
+        # 24 kHz, mono, s16le = 48,000 bytes/sec.
+        BYTES_PER_SECOND = 24000 * 2
+        START_BUFFER_MS = PLAYBACK_START_BUFFER_MS
+        START_BUFFER_BYTES = BYTES_PER_SECOND * START_BUFFER_MS // 1000
+
+        buffered = bytearray()
+        started = False
         stream: sd.RawOutputStream | None = None
+
+        async def write_buffered() -> None:
+            nonlocal buffered
+            if not buffered or stream is None:
+                return
+
+            # Keep writes reasonably chunky so the OS sees fewer tiny writes.
+            WRITE_BYTES = BYTES_PER_SECOND * PLAYBACK_WRITE_CHUNK_MS // 1000
+            while len(buffered) >= WRITE_BYTES:
+                block = bytes(buffered[:WRITE_BYTES])
+                del buffered[:WRITE_BYTES]
+                await asyncio.to_thread(stream.write, block)
 
         try:
             while True:
                 pcm = await audio_queue.get()
                 try:
                     if pcm is None:
+                        # Flush anything left at the end of the response.
+                        # If the whole response was shorter than the startup
+                        # buffer, open the output stream now so that audio is
+                        # still played instead of being discarded.
+                        if buffered:
+                            if stream is None:
+                                stream = sd.RawOutputStream(
+                                    device=None,
+                                    samplerate=24000,
+                                    channels=1,
+                                    dtype="int16",
+                                    blocksize=0,
+                                )
+                                stream.start()
+                                started = True
+                                self._log(
+                                    f"Streaming audio output ready "
+                                    f"(short response buffer="
+                                    f"{len(buffered) / BYTES_PER_SECOND:.2f}s)"
+                                )
+
+                            await asyncio.to_thread(
+                                stream.write,
+                                bytes(buffered),
+                            )
+                            buffered.clear()
                         return
 
-                    if stream is None:
+                    buffered.extend(pcm)
+
+                    if not started:
+                        if len(buffered) < START_BUFFER_BYTES:
+                            continue
+
                         stream = sd.RawOutputStream(
                             device=None,
                             samplerate=24000,
@@ -282,21 +356,90 @@ class LiveVoiceAgent:
                             blocksize=0,
                         )
                         stream.start()
-                        self._log("Streaming audio output ready")
+                        started = True
 
-                    await asyncio.to_thread(
-                        stream.write,
-                        pcm,
-                    )
+                        self._log(
+                            f"Streaming audio output ready "
+                            f"(buffer={len(buffered) / BYTES_PER_SECOND:.2f}s)"
+                        )
+
+                    await write_buffered()
+
                 finally:
                     audio_queue.task_done()
+
         finally:
             if stream is not None:
+                # There can be a short tail smaller than WRITE_BYTES.
+                if buffered:
+                    try:
+                        await asyncio.to_thread(
+                            stream.write,
+                            bytes(buffered),
+                        )
+                    except Exception:
+                        pass
+
                 try:
                     stream.stop()
                     stream.close()
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # Word-safe Qwen -> Breeze text buffering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _take_breeze_text(
+        buffer: str,
+        force: bool = False,
+    ) -> tuple[list[str], str]:
+        """Return complete-word text chunks suitable for Breeze.
+
+        We never intentionally cut a word. Sentences flush immediately.
+        Otherwise, once the buffer reaches the maximum size, we cut at the
+        last whitespace before that limit.
+        """
+        chunks: list[str] = []
+        text = buffer
+
+        sentence_end = re.compile(
+            r"^(.+?[.!?。！？]+(?:[\"'”’)]*)(?:\s+|$))",
+            re.DOTALL,
+        )
+
+        while True:
+            match = sentence_end.match(text)
+            if not match:
+                break
+
+            chunk = match.group(1).strip()
+            if chunk:
+                chunks.append(chunk)
+
+            text = text[match.end():].lstrip()
+
+        # Keep latency low without ever splitting a word.
+        while len(text) >= BREEZE_TEXT_MAX_CHARS:
+            cut = text.rfind(" ", 0, BREEZE_TEXT_MAX_CHARS + 1)
+            if cut < BREEZE_TEXT_MIN_CHARS:
+                break
+
+            chunks.append(text[:cut].strip())
+            text = text[cut:].lstrip()
+
+        # Also release a useful phrase once it is complete and ends at a
+        # whitespace boundary. This avoids waiting for punctuation forever.
+        if len(text) >= BREEZE_TEXT_MIN_CHARS and text.endswith((" ", "\n")):
+            chunks.append(text.strip())
+            text = ""
+
+        if force and text.strip():
+            chunks.append(text.strip())
+            text = ""
+
+        return chunks, text
 
     # ------------------------------------------------------------------
     # STT -> streaming Qwen -> persistent Breeze -> speaker
@@ -359,6 +502,7 @@ class LiveVoiceAgent:
         llm_start = time.perf_counter()
         first_text_at: float | None = None
         response_parts: list[str] = []
+        breeze_text_buffer = ""
 
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
             maxsize=128
@@ -398,7 +542,33 @@ class LiveVoiceAgent:
                             )
 
                         response_parts.append(token)
-                        await breeze.send_text(token)
+
+                        # Do not pass arbitrary token fragments directly to
+                        # Breeze. Hold them until we have a complete word /
+                        # phrase, or a complete sentence.
+                        breeze_text_buffer += token
+                        text_chunks, breeze_text_buffer = self._take_breeze_text(
+                            breeze_text_buffer
+                        )
+
+                        for chunk in text_chunks:
+                            self._log(
+                                f"Breeze text chunk: {chunk[:120]}"
+                            )
+                            await breeze.send_text(chunk)
+
+                    # Flush the final partial phrase, but only after Qwen is
+                    # finished. At this point even the final short phrase is
+                    # a complete response fragment.
+                    final_chunks, breeze_text_buffer = self._take_breeze_text(
+                        breeze_text_buffer,
+                        force=True,
+                    )
+                    for chunk in final_chunks:
+                        self._log(
+                            f"Breeze final text chunk: {chunk[:120]}"
+                        )
+                        await breeze.send_text(chunk)
 
                     response = "".join(response_parts).strip()
 
