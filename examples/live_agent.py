@@ -253,57 +253,113 @@ class LiveVoiceAgent:
 
         return chunks, text
 
-    async def _tts_worker(self, tts_queue: asyncio.Queue[str | None]) -> None:
-        """Synthesize and play sentence chunks while Qwen keeps generating."""
+    async def _tts_synth_worker(
+        self,
+        tts_queue: asyncio.Queue[str | None],
+        audio_queue: asyncio.Queue[tuple[int, object] | None],
+    ) -> None:
+        """Synthesize sentences sequentially, independent of playback."""
+        sequence = 0
+
         while True:
             chunk = await tts_queue.get()
             try:
                 if chunk is None:
                     return
 
-                tts_start = time.perf_counter()
-                self._log(f'TTS start: "{chunk}"')
+                sequence += 1
+                index = sequence
+                self._log(f'TTS synth #{index} start: "{chunk[:120]}"')
+                started = time.perf_counter()
 
                 try:
-                    # Keep the known-good Breeze API for this step.
-                    # Only the scheduling is changed; Breeze itself is still
-                    # one-shot and playback still happens after synthesis.
-                    tts_result = await asyncio.to_thread(
+                    # Keep the known-good Breeze one-shot synthesis API for
+                    # this step. The important change is that playback is no
+                    # longer inside this worker.
+                    result = await asyncio.to_thread(
                         self._tts.synthesize,
                         chunk,
                     )
 
                     self._log(
-                        f"TTS done: {tts_result.duration_secs:.2f}s "
-                        f"({time.perf_counter() - tts_start:.2f}s wall)"
+                        f"TTS synth #{index} done: "
+                        f"{result.duration_secs:.2f}s "
+                        f"({time.perf_counter() - started:.2f}s wall)"
                     )
 
-                    if self._no_output:
-                        self._log("Output disabled")
-                        continue
-
-                    audio_out = (
-                        np.frombuffer(tts_result.pcm, dtype=np.int16)
-                        .astype(np.float32)
-                        / 32768.0
-                    )
-
-                    self._log("Playing TTS chunk...")
-                    await asyncio.to_thread(
-                        sd.play,
-                        audio_out,
-                        tts_result.sample_rate,
-                    )
-                    await asyncio.to_thread(sd.wait)
-                    self._log("Playback chunk complete")
+                    await audio_queue.put((index, result))
 
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self._log(f"TTS/playback error: {exc}", "ERROR")
+                    self._log(
+                        f"TTS synth #{index} error: {exc}",
+                        "ERROR",
+                    )
 
             finally:
                 tts_queue.task_done()
+
+    async def _playback_worker(
+        self,
+        audio_queue: asyncio.Queue[tuple[int, object] | None],
+    ) -> None:
+        """Play completed TTS sentences in strict sequence order."""
+        expected = 1
+        pending: dict[int, object] = {}
+
+        while True:
+            item = await audio_queue.get()
+            try:
+                if item is None:
+                    return
+
+                index, result = item
+                pending[index] = result
+
+                while expected in pending:
+                    current = pending.pop(expected)
+
+                    if self._no_output:
+                        self._log(
+                            f"Output disabled for TTS chunk #{expected}"
+                        )
+                    else:
+                        audio_out = (
+                            np.frombuffer(
+                                current.pcm,
+                                dtype=np.int16,
+                            )
+                            .astype(np.float32)
+                            / 32768.0
+                        )
+
+                        self._log(
+                            f"Playing TTS chunk #{expected}..."
+                        )
+
+                        await asyncio.to_thread(
+                            sd.play,
+                            audio_out,
+                            current.sample_rate,
+                        )
+                        await asyncio.to_thread(sd.wait)
+
+                        self._log(
+                            f"Playback chunk #{expected} complete"
+                        )
+
+                    expected += 1
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log(
+                    f"Playback error: {exc}",
+                    "ERROR",
+                )
+            finally:
+                audio_queue.task_done()
 
     # ------------------------------------------------------------------
     # STT -> LLM -> TTS
@@ -379,12 +435,25 @@ class LiveVoiceAgent:
         response_parts: list[str] = []
         text_buffer = ""
 
-        # One TTS worker preserves sentence order and avoids sending
-        # concurrent generations to the single local Breeze instance.
+        # Two independent stages:
+        #
+        #   Qwen -> sentence queue -> Breeze synthesis -> audio queue
+        #                                                     -> playback
+        #
+        # This means sentence N+1 can be synthesized while sentence N is
+        # playing. Playback never blocks Breeze synthesis anymore.
         tts_queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4)
-        tts_task = asyncio.create_task(
-            self._tts_worker(tts_queue),
-            name="tts-worker",
+        audio_queue: asyncio.Queue[tuple[int, object] | None] = asyncio.Queue(
+            maxsize=8
+        )
+
+        synth_task = asyncio.create_task(
+            self._tts_synth_worker(tts_queue, audio_queue),
+            name="tts-synthesis-worker",
+        )
+        playback_task = asyncio.create_task(
+            self._playback_worker(audio_queue),
+            name="tts-playback-worker",
         )
 
         try:
@@ -406,19 +475,23 @@ class LiveVoiceAgent:
                 response_parts.append(token)
                 text_buffer += token
 
-                # As soon as a sentence is complete, send it to Breeze.
                 chunks, text_buffer = self._extract_tts_chunks(text_buffer)
+
                 for chunk in chunks:
-                    self._log(f"Queueing TTS sentence: {chunk[:120]}")
+                    self._log(
+                        f"Queueing TTS sentence: {chunk[:120]}"
+                    )
                     await tts_queue.put(chunk)
 
-            # Flush any final partial sentence.
             chunks, text_buffer = self._extract_tts_chunks(
                 text_buffer,
                 force=True,
             )
+
             for chunk in chunks:
-                self._log(f"Queueing final TTS sentence: {chunk[:120]}")
+                self._log(
+                    f"Queueing final TTS sentence: {chunk[:120]}"
+                )
                 await tts_queue.put(chunk)
 
             response = "".join(response_parts).strip()
@@ -432,21 +505,34 @@ class LiveVoiceAgent:
                 self._log("Empty LLM response", "WARN")
                 return
 
-            # Wait until every queued sentence has been synthesized and
-            # played before closing this turn.
+            # All Qwen sentences have been submitted. Let Breeze finish
+            # synthesizing and let the playback worker drain them in order.
             await tts_queue.join()
+            await audio_queue.join()
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._log(f"LLM/TTS pipeline error: {exc}", "ERROR")
+            self._log(
+                f"LLM/TTS pipeline error: {exc}",
+                "ERROR",
+            )
         finally:
-            # Stop the TTS worker after all queued work is complete.
-            if not tts_task.done():
+            # Stop synthesis worker only after all queued text is synthesized.
+            if not synth_task.done():
                 await tts_queue.put(None)
 
             await asyncio.gather(
-                tts_task,
+                synth_task,
+                return_exceptions=True,
+            )
+
+            # Then stop playback after every synthesized result has played.
+            if not playback_task.done():
+                await audio_queue.put(None)
+
+            await asyncio.gather(
+                playback_task,
                 return_exceptions=True,
             )
 
