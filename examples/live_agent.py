@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import queue
+import re
 import signal
 import sys
 import time
@@ -209,6 +210,102 @@ class LiveVoiceAgent:
                 pass
 
     # ------------------------------------------------------------------
+    # Streaming Qwen -> sentence queue -> Breeze
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_tts_chunks(
+        buffer: str,
+        force: bool = False,
+    ) -> tuple[list[str], str]:
+        """Extract complete speech-sized chunks from streamed LLM text."""
+        chunks: list[str] = []
+        text = buffer
+
+        sentence_re = re.compile(
+            r"(.+?[.!?。！？]+(?:[\"'”’)]*)"
+            r"(?=\s+|$))",
+            re.DOTALL,
+        )
+
+        while True:
+            match = sentence_re.match(text)
+            if not match:
+                break
+
+            chunk = match.group(1).strip()
+            if chunk:
+                chunks.append(chunk)
+
+            text = text[match.end():].lstrip()
+
+        # Avoid waiting indefinitely for punctuation.
+        max_chars = 120
+        if len(text) >= max_chars:
+            cut = text.rfind(" ", 0, max_chars + 1)
+            if cut >= 40:
+                chunks.append(text[:cut].strip())
+                text = text[cut:].lstrip()
+
+        if force and text.strip():
+            chunks.append(text.strip())
+            text = ""
+
+        return chunks, text
+
+    async def _tts_worker(self, tts_queue: asyncio.Queue[str | None]) -> None:
+        """Synthesize and play sentence chunks while Qwen keeps generating."""
+        while True:
+            chunk = await tts_queue.get()
+            try:
+                if chunk is None:
+                    return
+
+                tts_start = time.perf_counter()
+                self._log(f'TTS start: "{chunk}"')
+
+                try:
+                    # Keep the known-good Breeze API for this step.
+                    # Only the scheduling is changed; Breeze itself is still
+                    # one-shot and playback still happens after synthesis.
+                    tts_result = await asyncio.to_thread(
+                        self._tts.synthesize,
+                        chunk,
+                    )
+
+                    self._log(
+                        f"TTS done: {tts_result.duration_secs:.2f}s "
+                        f"({time.perf_counter() - tts_start:.2f}s wall)"
+                    )
+
+                    if self._no_output:
+                        self._log("Output disabled")
+                        continue
+
+                    audio_out = (
+                        np.frombuffer(tts_result.pcm, dtype=np.int16)
+                        .astype(np.float32)
+                        / 32768.0
+                    )
+
+                    self._log("Playing TTS chunk...")
+                    await asyncio.to_thread(
+                        sd.play,
+                        audio_out,
+                        tts_result.sample_rate,
+                    )
+                    await asyncio.to_thread(sd.wait)
+                    self._log("Playback chunk complete")
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log(f"TTS/playback error: {exc}", "ERROR")
+
+            finally:
+                tts_queue.task_done()
+
+    # ------------------------------------------------------------------
     # STT -> LLM -> TTS
     # ------------------------------------------------------------------
 
@@ -275,11 +372,20 @@ class LiveVoiceAgent:
             )
             return
 
-        # ---------------- STREAMING LLM ----------------
+        # ---------------- STREAMING LLM + OVERLAPPED TTS ----------------
         self._log("Generating response (streaming)...")
         llm_start = time.perf_counter()
         first_text_at: float | None = None
         response_parts: list[str] = []
+        text_buffer = ""
+
+        # One TTS worker preserves sentence order and avoids sending
+        # concurrent generations to the single local Breeze instance.
+        tts_queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=4)
+        tts_task = asyncio.create_task(
+            self._tts_worker(tts_queue),
+            name="tts-worker",
+        )
 
         try:
             async for token in self._llm.chat_stream(
@@ -297,75 +403,52 @@ class LiveVoiceAgent:
                         f"{first_text_at - llm_start:.2f}s"
                     )
 
-                # Only normal assistant content is yielded by chat_stream().
-                # reasoning_content is intentionally excluded by the adapter.
                 response_parts.append(token)
+                text_buffer += token
+
+                # As soon as a sentence is complete, send it to Breeze.
+                chunks, text_buffer = self._extract_tts_chunks(text_buffer)
+                for chunk in chunks:
+                    self._log(f"Queueing TTS sentence: {chunk[:120]}")
+                    await tts_queue.put(chunk)
+
+            # Flush any final partial sentence.
+            chunks, text_buffer = self._extract_tts_chunks(
+                text_buffer,
+                force=True,
+            )
+            for chunk in chunks:
+                self._log(f"Queueing final TTS sentence: {chunk[:120]}")
+                await tts_queue.put(chunk)
 
             response = "".join(response_parts).strip()
-            llm_time = time.perf_counter() - llm_start
 
-            preview = response[:160].replace("\n", " ")
             self._log(
-                f"LLM: {preview}... ({llm_time:.2f}s)"
+                f"LLM: {response[:160].replace(chr(10), ' ')}... "
+                f"({time.perf_counter() - llm_start:.2f}s)"
             )
+
+            if not response:
+                self._log("Empty LLM response", "WARN")
+                return
+
+            # Wait until every queued sentence has been synthesized and
+            # played before closing this turn.
+            await tts_queue.join()
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._log(f"LLM error: {exc}", "ERROR")
-            return
+            self._log(f"LLM/TTS pipeline error: {exc}", "ERROR")
+        finally:
+            # Stop the TTS worker after all queued work is complete.
+            if not tts_task.done():
+                await tts_queue.put(None)
 
-        if not response:
-            self._log("Empty LLM response", "WARN")
-            return
-
-        # ---------------- TTS ----------------
-        self._log("Synthesizing...")
-        tts_start = time.perf_counter()
-
-        try:
-            tts_result = await asyncio.to_thread(
-                self._tts.synthesize,
-                response,
+            await asyncio.gather(
+                tts_task,
+                return_exceptions=True,
             )
-
-            tts_time = time.perf_counter() - tts_start
-
-            self._log(
-                f"TTS: {tts_result.duration_secs:.2f}s "
-                f"({tts_time:.2f}s wall)"
-            )
-
-        except Exception as exc:
-            self._log(f"TTS error: {exc}", "ERROR")
-            return
-
-        # ---------------- Playback ----------------
-        if self._no_output:
-            self._log("Output disabled")
-            return
-
-        try:
-            audio_out = (
-                np.frombuffer(tts_result.pcm, dtype=np.int16)
-                .astype(np.float32)
-                / 32768.0
-            )
-
-            self._log("Playing...")
-
-            # No device argument = Windows/system default output.
-            await asyncio.to_thread(
-                sd.play,
-                audio_out,
-                tts_result.sample_rate,
-            )
-            await asyncio.to_thread(sd.wait)
-
-            self._log("Playback complete")
-
-        except Exception as exc:
-            self._log(f"Playback error: {exc}", "ERROR")
 
     # ------------------------------------------------------------------
     # Audio/VAD loop
