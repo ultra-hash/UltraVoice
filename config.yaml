@@ -1,0 +1,51 @@
+# Ultravoice - Interactive Voice Agent Configuration
+
+app:
+  name: "ultravoice"
+  version: "0.1.0"
+  debug: false
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  sample_width: 2          # 16-bit PCM
+  chunk_duration_ms: 20
+  input_device: null         # null = default device
+  output_device: null        # null = default device
+  silence_threshold: 0.01
+  silence_duration_ms: 600   # ms of silence before VAD triggers
+  playback_buffer_size: 3    # sentences to pre-buffer
+
+llm:
+  provider: "qwen"
+  model: "Qwen3.6-35B-A3B-UD-Q4_K_M"
+  temperature: 0.7
+  max_tokens: 512
+  api_key: "${QWEN_API_KEY}"  # env var substitution
+  base_url: "http://127.0.0.1:8080"
+
+stt:
+  provider: "whisper"
+  model: "base"              # base, small, medium, large
+  language: "en"
+  task: "transcribe"
+  api_key: "${WHISPER_API_KEY}"
+  base_url: "http://127.0.0.1:8081"
+
+tts:
+  provider: "breeze"
+  model: "breeze-2"
+  instruction: "Speak clearly and naturally."  # voice direction / design
+  voice_id: null                               # saved voice (from POST /v1/voices)
+  cfg_scale: 1.0                              # classifier-free guidance (1.0 = off)
+  temperature: null                           # sampling temperature
+  api_key: "${BREEZE_API_KEY}"
+  base_url: "http://127.0.0.1:8082"            # HTTP server (WS auto-discovered on port +1)
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(name)s] %(levelname)s: %(message)s"

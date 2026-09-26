@@ -1,0 +1,18 @@
+# Core
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+aiohttp>=3.9.0
+pyyaml>=6.0
+
+# Audio
+numpy>=1.26.0
+sounddevice>=0.4.6
+
+# ML / AI
+torch>=2.1.0
+silero-vad>=5.1.0
+openai>=1.0.0
+
+# Utilities
+python-dotenv>=1.0.0
