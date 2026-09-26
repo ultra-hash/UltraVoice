@@ -275,24 +275,33 @@ class LiveVoiceAgent:
             )
             return
 
-        # ---------------- LLM ----------------
-        self._log("Generating response...")
+        # ---------------- STREAMING LLM ----------------
+        self._log("Generating response (streaming)...")
         llm_start = time.perf_counter()
+        first_text_at: float | None = None
+        response_parts: list[str] = []
 
         try:
-            llm_result = await asyncio.to_thread(
-                self._llm.chat,
+            async for token in self._llm.chat_stream(
                 transcribed,
                 system=self._system,
                 options=ChatOptions(max_tokens=150),
-            )
+            ):
+                if not token:
+                    continue
 
-            response = (llm_result.text or "").strip()
+                if first_text_at is None:
+                    first_text_at = time.perf_counter()
+                    self._log(
+                        f"LLM first text: "
+                        f"{first_text_at - llm_start:.2f}s"
+                    )
 
-            # Some reasoning models put output in reasoning_content.
-            if not response and llm_result.reasoning_content:
-                response = llm_result.reasoning_content.strip()
+                # Only normal assistant content is yielded by chat_stream().
+                # reasoning_content is intentionally excluded by the adapter.
+                response_parts.append(token)
 
+            response = "".join(response_parts).strip()
             llm_time = time.perf_counter() - llm_start
 
             preview = response[:160].replace("\n", " ")
@@ -300,6 +309,8 @@ class LiveVoiceAgent:
                 f"LLM: {preview}... ({llm_time:.2f}s)"
             )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._log(f"LLM error: {exc}", "ERROR")
             return

@@ -224,6 +224,59 @@ class BreezeHTTPAdapter:
             if tail:
                 yield tail
 
+    async def synthesize_stream_async(
+        self,
+        text: str,
+        voice_id: str | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Asynchronously stream raw s16le PCM as Breeze generates it.
+
+        This is the preferred path for the live voice agent because it does
+        not block the asyncio event loop while waiting for Breeze output.
+        """
+        url = f"{self._base_url}/v1/audio/speech"
+
+        data: dict[str, Any] = {
+            "text": text,
+            "instruction": self._instruction,
+            "cfg_scale": str(self._cfg_scale),
+            "seed": str(self._seed),
+            "split_chars": str(self._split_chars),
+            "max_new_tokens": str(self._max_new_tokens),
+        }
+
+        if self._temperature is not None:
+            data["temperature"] = str(self._temperature)
+        if self._top_k is not None:
+            data["top_k"] = str(self._top_k)
+        if self._top_p is not None:
+            data["top_p"] = str(self._top_p)
+        if self._repetition_penalty is not None:
+            data["repetition_penalty"] = str(self._repetition_penalty)
+        if voice_id:
+            data["voice_id"] = voice_id
+
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with client.stream("POST", url, data=data) as resp:
+                if resp.status_code == 409:
+                    raise RuntimeError(
+                        "Server busy — another generation is running"
+                    )
+                if resp.status_code == 404:
+                    raise RuntimeError(f"Unknown voice_id: {voice_id}")
+                resp.raise_for_status()
+
+                tail = b""
+                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    chunk = tail + chunk
+                    n = len(chunk) // 2
+                    tail = chunk[n * 2:]
+                    if n > 0:
+                        yield chunk[: n * 2]
+
+                if tail:
+                    yield tail
+
     def _pcm_to_wav(self, audio: np.ndarray | bytes) -> bytes:
         """Convert PCM numpy array or bytes to WAV bytes."""
         if isinstance(audio, np.ndarray):
@@ -629,6 +682,21 @@ class BreezeTTS:
         if self._mode == "http" and self._http:
             return self._http.synthesize_stream(text, voice_id)
         raise RuntimeError("HTTP streaming not available in websocket mode")
+
+    async def synthesize_stream_async(
+        self,
+        text: str,
+        voice_id: str | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Stream PCM asynchronously in HTTP mode."""
+        if self._mode == "http" and self._http:
+            async for chunk in self._http.synthesize_stream_async(text, voice_id):
+                yield chunk
+            return
+
+        raise RuntimeError(
+            "Async HTTP streaming is only available in HTTP mode"
+        )
 
     # ---- Public API (WebSocket mode) --------------------------------------
 

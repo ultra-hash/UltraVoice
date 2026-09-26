@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator, Optional
 
-from openai import OpenAI, NOT_GIVEN
+from openai import OpenAI, AsyncOpenAI, NOT_GIVEN
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +95,11 @@ class QwenLLM:
             api_key=key,
             timeout=timeout,
         )
+        self._async_client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=key,
+            timeout=timeout,
+        )
         self._model = model
         self._timeout = timeout
         self._default_options = default_options or ChatOptions()
@@ -157,6 +162,15 @@ class QwenLLM:
             "max_tokens": opts.max_tokens,
             "temperature": opts.temperature,
             "top_p": opts.top_p,
+            # Qwen3.6 defaults to thinking with this server/template.
+            # Disable it explicitly so the final answer is emitted as
+            # normal assistant content instead of consuming the token
+            # budget in reasoning_content.
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                },
+            },
         }
 
         if opts.top_k > 0:
@@ -238,10 +252,10 @@ class QwenLLM:
         elapsed = time.time() - start
         choice = response.choices[0]
 
+        # Reasoning is deliberately kept separate from the assistant response.
+        # Never fall back to reasoning_content for user-visible/TTS output.
         text = choice.message.content or ""
         reasoning = getattr(choice.message, "reasoning_content", None) or ""
-        if not text and reasoning:
-            text = reasoning
 
         result = CompletionResult(
             text=text,
@@ -263,17 +277,17 @@ class QwenLLM:
 
     # ---- Streaming chat -------------------------------------------------
 
-    def chat_stream(
+    async def chat_stream(
         self,
         user_message: str,
         system: str | None = None,
         history: list[ChatMessage] | None = None,
         options: ChatOptions | None = None,
     ) -> AsyncIterator[str]:
-        """Stream chat completion tokens.
+        """Stream only assistant response content.
 
-        Yields:
-            Individual token strings as they are generated.
+        ``reasoning_content`` from reasoning models such as Qwen is
+        intentionally ignored and is never yielded to the caller/TTS.
         """
         messages: list[dict[str, Any]] = []
         if system:
@@ -291,23 +305,45 @@ class QwenLLM:
             "temperature": opts.temperature,
             "top_p": opts.top_p,
             "stream": True,
+            # Critical for Qwen3.6 + llama.cpp: request non-thinking mode.
+            # This makes the model emit the user-facing answer in
+            # delta.content. We still never forward reasoning_content.
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                },
+            },
         }
 
         if opts.top_k > 0:
             params["top_k"] = opts.top_k
+        if opts.presence_penalty != 0.0:
+            params["presence_penalty"] = opts.presence_penalty
+        if opts.frequency_penalty != 0.0:
+            params["frequency_penalty"] = opts.frequency_penalty
         if opts.seed is not None:
             params["seed"] = opts.seed
+        if opts.stop:
+            params["stop"] = opts.stop
 
-        stream = self._client.chat.completions.create(**params)
+        stream = await self._async_client.chat.completions.create(**params)
 
-        for chunk in stream:
+        reasoning_chunks = 0
+
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+
             delta = chunk.choices[0].delta
-            # Normal content
+
+            # ONLY normal assistant content enters the voice pipeline.
+            # Qwen reasoning_content is intentionally ignored.
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_chunks += 1
+
             if delta.content:
                 yield delta.content
-            # Reasoning models (Qwen, DeepSeek) return reasoning_content in streaming
-            elif hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                yield delta.reasoning_content
 
     async def chat_stream_full(
         self,
@@ -316,12 +352,11 @@ class QwenLLM:
         history: list[ChatMessage] | None = None,
         options: ChatOptions | None = None,
     ) -> CompletionResult:
-        """Stream chat and collect full result.
-
-        Yields tokens as they arrive AND returns the complete result.
-        """
+        """Stream chat and collect the normal assistant response."""
         full_text = ""
-        async for token in self.chat_stream(user_message, system, history, options):
+        async for token in self.chat_stream(
+            user_message, system, history, options
+        ):
             full_text += token
 
         opts = options or self._default_options
