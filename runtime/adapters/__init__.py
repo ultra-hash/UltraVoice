@@ -1,5 +1,6 @@
 """Adapters — external service integrations."""
 
+from runtime.adapters.audio_cpp_tts import AudioCppTTS
 from runtime.adapters.breeze_tts import (
     BreezeHTTPAdapter,
     BreezeTTS,
@@ -23,6 +24,8 @@ from runtime.adapters.whisper_stt import (
 )
 
 __all__ = [
+    # audio.cpp (Kokoro-TTS)
+    "AudioCppTTS",
     # Breeze TTS
     "BreezeHTTPAdapter",
     "BreezeTTS",

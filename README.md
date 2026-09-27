@@ -2,8 +2,9 @@
 
 Real-time interactive voice agent with streaming LLM, STT, and TTS.
 
-The live agent streams LLM tokens to Breeze TTS incrementally — no waiting
-for the full response. A jitter buffer smooths Breeze's variable PCM delivery.
+The live agent streams LLM tokens to audio.cpp (Kokoro-TTS) incrementally
+— no waiting for the full response. A jitter buffer smooths TTS's variable
+PCM delivery.
 
 ## Architecture
 
@@ -29,6 +30,7 @@ ultravoice/
 │   ├── test_whisper_stt.py          # STT verification tests
 │   ├── test_qwen_llm.py             # LLM verification tests
 │   ├── test_breeze_tts.py           # TTS verification tests
+│   ├── test_audio_cpp_tts.py        # audio.cpp / Kokoro-TTS tests
 │   └── test_pipeline.py             # End-to-end pipeline tests
 │
 ├── examples/
@@ -39,20 +41,7 @@ ultravoice/
 │   ├── mic_probe.py                 # Microphone detection utility
 │   └── mic_backend_probe.py         # Backend audio utility
 │
-├── some-reference-notes/
-│   └── breeze-tts-docs/             # Breeze-TTS reference documentation
-│       ├── README.md
-│       ├── architecture.md
-│       ├── server.md
-│       ├── websocket.md
-│       ├── voices.md
-│       ├── cli.md
-│       ├── models.md
-│       ├── build.md
-│       ├── c-api.md
-│       ├── ctypes.md
-│       └── voice-conversion.md
-│
+
 └── audio samples / outputs (git-ignored)
     ├── breeze_test.wav
     ├── pipeline_output.wav
@@ -60,10 +49,10 @@ ultravoice/
 ```
 
 ```
-┌─────────────┐    ┌──────────┐    ┌───────┐    ┌───────┐    ┌──────────┐
-│  Capture    │───▶│   STT    │───▶│  LLM  │───▶│  TTS  │───▶│ Playback │
-│  (Mic + VAD)│    │(Whisper) │    │ (Qwen)│    │(Breeze)│    │ (Speakers)│
-└─────────────┘    └──────────┘    └───────┘    └───────┘    └──────────┘
+┌─────────────┐    ┌──────────┐    ┌───────┐    ┌──────────┐    ┌──────────┐
+│  Capture    │───▶│   STT    │───▶│  LLM  │───▶│  TTS     │───▶│ Playback │
+│  (Mic + VAD)│    │(Whisper) │    │ (Qwen)│    │(audio.cpp)│    │ (Speakers)│
+└─────────────┘    └──────────┘    └───────┘    └──────────┘    └──────────┘
 ```
 
 ## Setup
@@ -80,7 +69,11 @@ pip install -r requirements.txt
 |---------|------|-------------|
 | Whisper STT | `8081` | whisper.cpp (`/inference`) |
 | Qwen LLM | `8080` | Qwen3.6-35B (OpenAI-compatible) |
-| Breeze TTS | `8082` | HTTP + `8083` WebSocket |
+| Breeze TTS | `8082` / `8083` | HTTP + WebSocket (optional) |
+| audio.cpp | `8082` | Kokoro-TTS (used by live agent) |
+
+> **Note**: Breeze TTS and audio.cpp both default to port `8082`. Only one
+> should be running at a time. The live agent uses **audio.cpp** by default.
 
 ### 3. Configure
 
@@ -99,9 +92,15 @@ stt:
   language: "en"
 
 tts:
+  provider: "breeze"              # HTTP/WS adapter (optional)
   base_url: "http://127.0.0.1:8082"
   instruction: "Speak clearly and naturally."
   cfg_scale: 1.0
+
+  # audio.cpp (Kokoro-TTS) — used by live_agent.py
+  audio_cpp_base_url: "http://127.0.0.1:8082"
+  audio_cpp_model: "kokoro-tts"
+  audio_cpp_sample_rate: 24000
 ```
 
 Environment variables are substituted for API keys:
@@ -120,6 +119,7 @@ export BREEZE_API_KEY="..."
 | **whisper_stt.py** | `WhisperSTT`, `LocalWhisperAdapter`, `RemoteWhisperAdapter`, `WhisperModel`, `TranscriptionResult` | Speech-to-Text — OpenAI-compatible API or local faster-whisper |
 | **qwen_llm.py** | `QwenLLM`, `ChatMessage`, `ChatOptions`, `CompletionResult` | LLM — Qwen via OpenAI-compatible API (vLLM, llama.cpp, Ollama) |
 | **breeze_tts.py** | `BreezeTTS`, `BreezeHTTPAdapter`, `BreezeWSAdapter`, `BreezeVoiceManager`, `SynthesisResult`, `VoiceInfo` | Text-to-Speech — Breeze-TTS-2 HTTP + WebSocket |
+| **audio_cpp_tts.py** | `AudioCppTTS`, `AudioCppTTSError` | Text-to-Speech — audio.cpp backend (Kokoro-TTS) |
 
 ### `runtime/`
 
@@ -131,7 +131,8 @@ export BREEZE_API_KEY="..."
 
 ## Live Voice Agent
 
-Real-time mic-to-speaker interaction with Silero VAD, streaming LLM→TTS, and jitter-buffered playback.
+Real-time mic-to-speaker interaction with Silero VAD, streaming Qwen LLM →
+audio.cpp (Kokoro-TTS), and jitter-buffered playback.
 
 ### Quick Start
 
@@ -172,9 +173,9 @@ python -m runtime.live_agent --pre-roll-ms 300
 | **VAD** | Silero VAD (16 kHz, threshold: 0.45) |
 | **STT** | Remote whisper.cpp via `http://127.0.0.1:8081/inference` |
 | **LLM** | Qwen3.6-35B with `enable_thinking: False` — normal content only |
-| **TTS streaming** | Persistent Breeze WebSocket session — LLM tokens sent incrementally |
+| **TTS streaming** | Persistent audio.cpp WebSocket session — LLM tokens sent incrementally |
 | **Text buffering** | Word-safe chunking — never cuts mid-word; sentences flush immediately |
-| **Playback** | Jitter buffer (2 s startup) smooths Breeze's variable PCM delivery |
+| **Playback** | Jitter buffer (2 s startup) smooths audio.cpp's variable PCM delivery |
 | **Turn management** | Single-threaded — drops speech if previous turn still processing |
 
 ### Tuning Parameters
@@ -189,9 +190,13 @@ python -m runtime.live_agent --pre-roll-ms 300
 | `max_speech_seconds` | 30 | Hard limit on speech duration |
 | `pre_roll_ms` | 250 | Audio retained before VAD triggers |
 | `playback_start_buffer_ms` | 2000 | PCM pre-buffer before speaker starts |
-| `breeze_text_min_chars` | 150 | Min chars before releasing a TTS chunk |
-| `breeze_text_max_chars` | 600 | Max chars before forcing a chunk |
+| `playback_write_chunk_ms` | 80 | Playback write granularity |
+| `tts_text_min_chars` | 150 | Min chars before releasing an audio.cpp text chunk |
+| `tts_text_max_chars` | 600 | Max chars before forcing an audio.cpp text chunk |
+| `tts_pcm_sample_rate` | 24000 | audio.cpp native PCM sample rate |
+| `audio_queue_maxsize` | 180 | PCM queue capacity between receiver and playback |
 | `llm_max_tokens` | 180 | Per-turn LLM response limit |
+| `clean_tts_text` | true | Remove Markdown artifacts before TTS |
 
 ### Diagnostics
 
@@ -250,6 +255,28 @@ Sample rate:    24000 Hz
 PCM format:     signed 16-bit little endian (s16le)
 ```
 
+---
+
+### audio.cpp / Kokoro-TTS (`tests/test_audio_cpp_tts.py`)
+
+| Test | What it verifies | Status |
+|------|------------------|--------|
+| Server Health Check | HTTP server on port 8082, Kokoro-TTS endpoint | ✅ Verified |
+| HTTP Synthesis | `POST /v1/audio/speech` — text → WAV | ✅ Verified |
+| AudioCppTTS Class | `persistent_session()`, `send_text()`, `end()` | ✅ Verified |
+| from_config() | Config.yaml loading | ✅ Verified |
+| Error Handling | Connection errors caught gracefully (no crash) | ✅ Verified |
+
+**Verified Configuration**
+```
+audio.cpp server:  http://127.0.0.1:8082
+Endpoint:          /v1/audio/speech
+Model:             kokoro-tts
+Sample rate:       24000 Hz
+PCM format:        signed 16-bit little endian (s16le)
+Mode:              offline (per-request WAV generation)
+```
+
 ### Qwen LLM (`tests/test_qwen_llm.py`)
 
 | Test | What it verifies | Status |
@@ -302,6 +329,9 @@ python tests/test_qwen_llm.py
 
 # TTS tests
 python tests/test_breeze_tts.py
+
+# audio.cpp / Kokoro-TTS tests
+python tests/test_audio_cpp_tts.py
 
 # Pipeline test
 python tests/test_pipeline.py
@@ -369,6 +399,42 @@ BreezeTTS.save_wav(result, "output.wav")
 BreezeTTS.play(result, blocking=True)
 ```
 
+### TTS (audio.cpp / Kokoro-TTS)
+
+```python
+from runtime.adapters.audio_cpp_tts import AudioCppTTS
+import asyncio
+
+# Create adapter
+async def main():
+    tts = AudioCppTTS.from_config()
+    text = "Hello from Kokoro!"
+    print(f"Text: {text}")
+
+    # Use persistent session for streaming
+    async with tts.persistent_session() as session:
+        await session.send_text(text)
+        await session.end()
+
+        # Receive PCM chunks
+        pcm_chunks = []
+        while True:
+            msg = await session.receive()
+            if isinstance(msg, bytes):
+                pcm_chunks.append(msg)
+            elif isinstance(msg, str):
+                import json
+                data = json.loads(msg)
+                if data.get("type") == "done":
+                    break
+
+    pcm = b"".join(pcm_chunks)
+    print(f"PCM: {len(pcm):,} bytes")
+    # Save or play...
+
+asyncio.run(main())
+```
+
 ### Voice Pipeline
 
 ```python
@@ -429,6 +495,27 @@ class BreezeTTS:
     async def cancel(self) -> None
     @asynccontextmanager
     async def persistent_session(self) -> AsyncIterator[BreezeWSAdapter]
+```
+
+### AudioCppTTS
+
+```python
+class AudioCppTTS:
+    @classmethod
+    def from_config(cls) -> AudioCppTTS
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8082",
+                  model: str = "kokoro-tts",
+                  sample_rate: int = 24000,
+                  voice: str | None = None,
+                  speed: float | None = None,
+                  instruction: str | None = None,
+                  timeout: float = 120.0)
+
+    def persistent_session(self) -> _Session
+    async def send_text(self, text: str) -> None
+    async def end(self) -> None
+    async def receive(self) -> bytes | str
 ```
 
 ## Data Classes
@@ -518,6 +605,13 @@ tts:
   temperature: null
   api_key: "${BREEZE_API_KEY}"
   base_url: "http://127.0.0.1:8082"
+
+  # audio.cpp (Kokoro-TTS) settings — used by live_agent.py
+  audio_cpp_base_url: "http://127.0.0.1:8082"
+  audio_cpp_model: "kokoro-tts"
+  audio_cpp_sample_rate: 24000
+  voice: null
+  speed: null
 
 server:
   host: "0.0.0.0"
