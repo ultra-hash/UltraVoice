@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-UltraVoice - Live Mic -> VAD -> Whisper -> Qwen -> Breeze -> Speaker
+UltraVoice - Live Mic -> VAD -> Whisper -> Qwen -> audio.cpp -> Speaker
 
 Uses the Windows/system default audio input and output devices.
 
 Pipeline:
-    Mic -> VAD -> Whisper STT -> Qwen LLM -> Breeze TTS -> Speaker
+    Mic -> VAD -> Whisper STT -> Qwen LLM -> audio.cpp TTS -> Speaker
 
 Important:
 - Capture uses the system default microphone.
@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from runtime.adapters.whisper_stt import WhisperSTT
 from runtime.adapters.qwen_llm import QwenLLM, ChatOptions
-from runtime.adapters.breeze_tts import BreezeTTS
+from runtime.adapters.audio_cpp_tts import AudioCppTTS
 
 
 TARGET_SAMPLE_RATE = 16000
@@ -51,16 +51,38 @@ CHUNK_MS = 32
 
 # How much generated PCM to pre-buffer before speaker playback starts.
 # Lower = less initial latency, higher = more protection from TTS underflow.
-PLAYBACK_START_BUFFER_MS = 1000
+PLAYBACK_START_BUFFER_MS = 2000
+
 
 # Size of each speaker write. 80 ms is a reasonable balance between smooth
 # playback and responsiveness.
 PLAYBACK_WRITE_CHUNK_MS = 80
 
+# Persistent queue capacity between audio.cpp receiver and speaker playback.
+AUDIO_QUEUE_MAXSIZE = 180
+
+# Current playback pipeline keeps audio.cpp PCM at native 24 kHz.
+TTS_PCM_SAMPLE_RATE = 24000
+
+# Qwen response limit for each turn.
+LLM_MAX_TOKENS = 180
+
 # Qwen text is accumulated until we have a complete word and enough useful
-# text to send to Breeze. Never deliberately cut inside a word.
-BREEZE_TEXT_MIN_CHARS = 40
-BREEZE_TEXT_MAX_CHARS = 60
+# text to send to audio.cpp. Never deliberately cut inside a word.
+# Current test setting. Larger chunks may reduce per-chunk TTS overhead.
+# For the next throughput experiment, try 80 / 120.
+TTS_TEXT_MIN_CHARS = 150
+TTS_TEXT_MAX_CHARS = 600
+
+# TTS text cleanup. Removes Markdown syntax before text reaches audio.cpp.
+CLEAN_TTS_TEXT = True
+
+# Diagnostic polling interval used to detect periods where audio.cpp is not
+# delivering PCM quickly enough for the already-running speaker stream.
+PLAYBACK_STARVATION_CHECK_MS = 80
+
+# Placeholder for a future pitch-preserving time-stretch stage. Keeping this
+# at 1.00 means the PCM is played at its native rate with no modification.
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +157,101 @@ class VADDetector:
         return probability >= self._threshold
 
 
+
+def sanitize_tts_text(text: str) -> str:
+    """Remove common Markdown artifacts before text reaches TTS."""
+    if not CLEAN_TTS_TEXT:
+        return text
+
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<!\w)\*([^*]+)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", text)
+    text = re.sub(r"[\t ]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+class TTSDiagnostics:
+    """Per-turn metrics for audio.cpp PCM production and playback buffering."""
+
+    def __init__(self) -> None:
+        self.first_pcm_at: float | None = None
+        self.last_pcm_at: float | None = None
+        self.total_pcm_bytes = 0
+        self.min_buffer_seconds = float("inf")
+        self.max_buffer_seconds = 0.0
+        self.starvation_events = 0
+        self.playback_started_at: float | None = None
+        self.playback_started_buffer_seconds = 0.0
+        self.text = ""
+
+    def record_pcm(self, byte_count: int) -> None:
+        now = time.perf_counter()
+        if self.first_pcm_at is None:
+            self.first_pcm_at = now
+        self.last_pcm_at = now
+        self.total_pcm_bytes += byte_count
+
+    def record_buffer(self, seconds: float) -> None:
+        self.min_buffer_seconds = min(self.min_buffer_seconds, seconds)
+        self.max_buffer_seconds = max(self.max_buffer_seconds, seconds)
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+
+    def summary(self) -> str:
+        bytes_per_second = TTS_PCM_SAMPLE_RATE * 2
+        generated_seconds = self.total_pcm_bytes / bytes_per_second
+
+        if self.first_pcm_at is not None and self.last_pcm_at is not None:
+            production_wall = max(
+                0.0,
+                self.last_pcm_at - self.first_pcm_at,
+            )
+        else:
+            production_wall = 0.0
+
+        ratio = (
+            generated_seconds / production_wall
+            if production_wall > 0.001
+            else 0.0
+        )
+
+        min_buffer = (
+            self.min_buffer_seconds
+            if self.min_buffer_seconds != float("inf")
+            else 0.0
+        )
+
+        if ratio >= 1.15:
+            interpretation = "producer faster than realtime"
+        elif ratio >= 0.95:
+            interpretation = "near realtime"
+        elif ratio > 0.0:
+            interpretation = "producer slower than realtime"
+        else:
+            interpretation = "no PCM timing data"
+
+        word_count = len(re.findall(r"\b[\w’'-]+\b", self.text))
+        speech_wpm = (word_count / generated_seconds * 60.0) if generated_seconds > 0.05 else 0.0
+
+        return (
+            f"words={word_count}, "
+            f"speech_rate={speech_wpm:.0f} WPM, "
+            f"PCM={generated_seconds:.2f}s, "
+            f"production={production_wall:.2f}s, "
+            f"producer_rate={ratio:.2f}x realtime, "
+            f"buffer_min={min_buffer:.2f}s, "
+            f"buffer_max={self.max_buffer_seconds:.2f}s, "
+            f"starvation_events={self.starvation_events}, "
+            f"{interpretation}"
+        )
+
 # ---------------------------------------------------------------------------
 # Live Voice Agent
 # ---------------------------------------------------------------------------
@@ -196,8 +313,38 @@ class LiveVoiceAgent:
         print("\nLoading adapters...")
         self._stt = WhisperSTT.from_config()
         self._llm = QwenLLM.from_config()
-        self._tts = BreezeTTS.from_config(mode="websocket")
+        self._tts = AudioCppTTS.from_config()
         print("  Adapters loaded OK")
+        self._print_tuning_summary()
+
+    # ------------------------------------------------------------------
+    # Startup tuning summary
+    # ------------------------------------------------------------------
+
+    def _print_tuning_summary(self) -> None:
+        """Print all important voice-pipeline tuning values for this run."""
+        print("\n  ------------------------------------------------------------")
+        print("  ACTIVE TUNING PARAMETERS")
+        print("  ------------------------------------------------------------")
+        print(f"  Capture sample rate:       {self._capture_rate} Hz")
+        print(f"  Capture chunk:             {CHUNK_MS} ms")
+        print(f"  VAD threshold:             {self._vad_threshold:.2f}")
+        print(f"  Silence duration:          {self._silence_duration_ms} ms")
+        print(f"  Pre-roll:                  {self._pre_roll_ms} ms")
+        print(f"  Min speech:                {self._min_speech_ms} ms")
+        print(f"  Max speech:                {self._max_speech_seconds:.1f} s")
+        print(f"  LLM max tokens:            {LLM_MAX_TOKENS}")
+        print(f"  audio.cpp text min chars:     {TTS_TEXT_MIN_CHARS}")
+        print(f"  audio.cpp text max chars:     {TTS_TEXT_MAX_CHARS}")
+        print(f"  audio.cpp PCM sample rate:    {TTS_PCM_SAMPLE_RATE} Hz")
+        print(f"  Playback start buffer:     {PLAYBACK_START_BUFFER_MS} ms")
+        print(f"  Playback write chunk:      {PLAYBACK_WRITE_CHUNK_MS} ms")
+        print(f"  Audio queue max size:      {AUDIO_QUEUE_MAXSIZE}")
+        print("  Speech-rate metric:         word_count / generated PCM duration")
+        print(f"  Clean TTS Markdown:         {CLEAN_TTS_TEXT}")
+        print(f"  Starvation check interval: {PLAYBACK_STARVATION_CHECK_MS} ms")
+        print("  TTS transport:              audio.cpp HTTP")
+        print("  ------------------------------------------------------------\n")
 
     # ------------------------------------------------------------------
     # Logging
@@ -228,20 +375,22 @@ class LiveVoiceAgent:
                 pass
 
     # ------------------------------------------------------------------
-    # Persistent Breeze streaming
+    # Persistent audio.cpp streaming
     # ------------------------------------------------------------------
 
-    async def _breeze_receiver(
+    async def _audio_cpp_receiver(
         self,
         session,
         audio_queue: asyncio.Queue[bytes | None],
+        diagnostics: TTSDiagnostics,
     ) -> None:
-        """Receive Breeze PCM continuously until the current turn is done."""
+        """Receive audio.cpp PCM continuously until the current turn is done."""
         while True:
             message = await session.receive()
 
             if isinstance(message, bytes):
                 if message:
+                    diagnostics.record_pcm(len(message))
                     await audio_queue.put(message)
                 continue
 
@@ -249,7 +398,7 @@ class LiveVoiceAgent:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 self._log(
-                    f"Unexpected Breeze message: {message!r}",
+                    f"Unexpected audio.cpp message: {message!r}",
                     "WARN",
                 )
                 continue
@@ -257,12 +406,12 @@ class LiveVoiceAgent:
             kind = data.get("type")
 
             if kind == "done":
-                self._log("Breeze turn complete")
+                self._log("audio.cpp turn complete")
                 return
 
             if kind == "error":
                 raise RuntimeError(
-                    data.get("message", "Breeze WebSocket error")
+                    data.get("message", "audio.cpp WebSocket error")
                 )
 
             # ready / started / speaking / queued are informational.
@@ -270,10 +419,11 @@ class LiveVoiceAgent:
     async def _pcm_playback_worker(
         self,
         audio_queue: asyncio.Queue[bytes | None],
+        diagnostics: TTSDiagnostics,
     ) -> None:
-        """Play Breeze PCM with a small jitter buffer to prevent underflow.
+        """Play audio.cpp PCM with a small jitter buffer to prevent underflow.
 
-        Breeze can temporarily pause between PCM packets while generating the
+        audio.cpp can temporarily pause between PCM packets while generating the
         next audio frames. Starting playback immediately on the first packet
         makes those pauses audible as clipped/choppy words. We therefore
         accumulate a short startup buffer, then keep a continuous output
@@ -289,24 +439,31 @@ class LiveVoiceAgent:
                     audio_queue.task_done()
 
         # 24 kHz, mono, s16le = 48,000 bytes/sec.
-        BYTES_PER_SECOND = 24000 * 2
+        BYTES_PER_SECOND = TTS_PCM_SAMPLE_RATE * 2
         START_BUFFER_MS = PLAYBACK_START_BUFFER_MS
         START_BUFFER_BYTES = BYTES_PER_SECOND * START_BUFFER_MS // 1000
+        WRITE_BYTES = BYTES_PER_SECOND * PLAYBACK_WRITE_CHUNK_MS // 1000
 
         buffered = bytearray()
         started = False
         stream: sd.RawOutputStream | None = None
+        last_queue_log = time.perf_counter()
+        min_queue_secs = float("inf")
+        max_queue_secs = 0.0
 
-        async def write_buffered() -> None:
+        async def write_buffered(final: bool = False) -> None:
             nonlocal buffered
             if not buffered or stream is None:
                 return
 
-            # Keep writes reasonably chunky so the OS sees fewer tiny writes.
-            WRITE_BYTES = BYTES_PER_SECOND * PLAYBACK_WRITE_CHUNK_MS // 1000
             while len(buffered) >= WRITE_BYTES:
                 block = bytes(buffered[:WRITE_BYTES])
                 del buffered[:WRITE_BYTES]
+                await asyncio.to_thread(stream.write, block)
+
+            if final and buffered:
+                block = bytes(buffered)
+                buffered.clear()
                 await asyncio.to_thread(stream.write, block)
 
         try:
@@ -322,7 +479,7 @@ class LiveVoiceAgent:
                             if stream is None:
                                 stream = sd.RawOutputStream(
                                     device=None,
-                                    samplerate=24000,
+                                    samplerate=TTS_PCM_SAMPLE_RATE,
                                     channels=1,
                                     dtype="int16",
                                     blocksize=0,
@@ -335,14 +492,26 @@ class LiveVoiceAgent:
                                     f"{len(buffered) / BYTES_PER_SECOND:.2f}s)"
                                 )
 
-                            await asyncio.to_thread(
-                                stream.write,
-                                bytes(buffered),
-                            )
-                            buffered.clear()
+                            await write_buffered(final=True)
+                        self._log(
+                            f"Audio buffer summary: min={min_queue_secs:.2f}s, "
+                            f"max={max_queue_secs:.2f}s; {diagnostics.summary()}"
+                        )
                         return
 
                     buffered.extend(pcm)
+
+                    queue_secs = len(buffered) / BYTES_PER_SECOND
+                    min_queue_secs = min(min_queue_secs, queue_secs)
+                    max_queue_secs = max(max_queue_secs, queue_secs)
+                    diagnostics.record_buffer(queue_secs)
+                    now = time.perf_counter()
+                    if now - last_queue_log >= 1.0:
+                        self._log(
+                            f"Audio buffer: {queue_secs:.2f}s "
+                            f"(min={min_queue_secs:.2f}s, max={max_queue_secs:.2f}s)"
+                        )
+                        last_queue_log = now
 
                     if not started:
                         if len(buffered) < START_BUFFER_BYTES:
@@ -350,20 +519,24 @@ class LiveVoiceAgent:
 
                         stream = sd.RawOutputStream(
                             device=None,
-                            samplerate=24000,
+                            samplerate=TTS_PCM_SAMPLE_RATE,
                             channels=1,
                             dtype="int16",
                             blocksize=0,
                         )
                         stream.start()
                         started = True
+                        diagnostics.playback_started_at = time.perf_counter()
+                        diagnostics.playback_started_buffer_seconds = (
+                            len(buffered) / BYTES_PER_SECOND
+                        )
 
                         self._log(
                             f"Streaming audio output ready "
                             f"(buffer={len(buffered) / BYTES_PER_SECOND:.2f}s)"
                         )
 
-                    await write_buffered()
+                    await write_buffered(final=False)
 
                 finally:
                     audio_queue.task_done()
@@ -373,10 +546,7 @@ class LiveVoiceAgent:
                 # There can be a short tail smaller than WRITE_BYTES.
                 if buffered:
                     try:
-                        await asyncio.to_thread(
-                            stream.write,
-                            bytes(buffered),
-                        )
+                        await write_buffered(final=True)
                     except Exception:
                         pass
 
@@ -387,15 +557,15 @@ class LiveVoiceAgent:
                     pass
 
     # ------------------------------------------------------------------
-    # Word-safe Qwen -> Breeze text buffering
+    # Word-safe Qwen -> audio.cpp text buffering
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _take_breeze_text(
+    def _take_audio_cpp_text(
         buffer: str,
         force: bool = False,
     ) -> tuple[list[str], str]:
-        """Return complete-word text chunks suitable for Breeze.
+        """Return complete-word text chunks suitable for audio.cpp.
 
         We never intentionally cut a word. Sentences flush immediately.
         Otherwise, once the buffer reaches the maximum size, we cut at the
@@ -405,7 +575,7 @@ class LiveVoiceAgent:
         text = buffer
 
         sentence_end = re.compile(
-            r"^(.+?[.!?。！？]+(?:[\"'”’)]*)(?:\s+|$))",
+            r"^(.+?(?<!\d)[.!?。！？]+(?:[\"'”’)]*)(?:\s+|$))",
             re.DOTALL,
         )
 
@@ -421,9 +591,9 @@ class LiveVoiceAgent:
             text = text[match.end():].lstrip()
 
         # Keep latency low without ever splitting a word.
-        while len(text) >= BREEZE_TEXT_MAX_CHARS:
-            cut = text.rfind(" ", 0, BREEZE_TEXT_MAX_CHARS + 1)
-            if cut < BREEZE_TEXT_MIN_CHARS:
+        while len(text) >= TTS_TEXT_MAX_CHARS:
+            cut = text.rfind(" ", 0, TTS_TEXT_MAX_CHARS + 1)
+            if cut < TTS_TEXT_MIN_CHARS:
                 break
 
             chunks.append(text[:cut].strip())
@@ -431,7 +601,7 @@ class LiveVoiceAgent:
 
         # Also release a useful phrase once it is complete and ends at a
         # whitespace boundary. This avoids waiting for punctuation forever.
-        if len(text) >= BREEZE_TEXT_MIN_CHARS and text.endswith((" ", "\n")):
+        if len(text) >= TTS_TEXT_MIN_CHARS and text.endswith((" ", "\n")):
             chunks.append(text.strip())
             text = ""
 
@@ -442,7 +612,7 @@ class LiveVoiceAgent:
         return chunks, text
 
     # ------------------------------------------------------------------
-    # STT -> streaming Qwen -> persistent Breeze -> speaker
+    # STT -> streaming Qwen -> persistent audio.cpp -> speaker
     # ------------------------------------------------------------------
 
     async def _process_turn(self, audio: np.ndarray) -> None:
@@ -497,39 +667,41 @@ class LiveVoiceAgent:
             self._log("Whisper returned BLANK_AUDIO", "WARN")
             return
 
-        # ---------------- Qwen + Breeze concurrently ----------------
+        # ---------------- Qwen + audio.cpp concurrently ----------------
         self._log("Generating response (streaming)...")
         llm_start = time.perf_counter()
         first_text_at: float | None = None
         response_parts: list[str] = []
-        breeze_text_buffer = ""
+        audio_cpp_text_buffer = ""
 
         audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
-            maxsize=128
+            maxsize=AUDIO_QUEUE_MAXSIZE
         )
+        diagnostics = TTSDiagnostics()
 
         playback_task = asyncio.create_task(
-            self._pcm_playback_worker(audio_queue),
-            name="breeze-pcm-playback",
+            self._pcm_playback_worker(audio_queue, diagnostics),
+            name="audio_cpp-pcm-playback",
         )
 
         try:
-            async with self._tts.persistent_session() as breeze:
+            async with self._tts.persistent_session() as audio_cpp:
                 receiver_task = asyncio.create_task(
-                    self._breeze_receiver(
-                        breeze,
+                    self._audio_cpp_receiver(
+                        audio_cpp,
                         audio_queue,
+                        diagnostics,
                     ),
-                    name="breeze-pcm-receiver",
+                    name="audio_cpp-pcm-receiver",
                 )
 
                 try:
                     # Every normal Qwen content fragment goes into the SAME
-                    # Breeze session. There is no new request per sentence.
+                    # audio.cpp session. There is no new request per sentence.
                     async for token in self._llm.chat_stream(
                         transcribed,
                         system=self._system,
-                        options=ChatOptions(max_tokens=150),
+                        options=ChatOptions(max_tokens=LLM_MAX_TOKENS),
                     ):
                         if not token:
                             continue
@@ -544,33 +716,40 @@ class LiveVoiceAgent:
                         response_parts.append(token)
 
                         # Do not pass arbitrary token fragments directly to
-                        # Breeze. Hold them until we have a complete word /
+                        # audio.cpp. Hold them until we have a complete word /
                         # phrase, or a complete sentence.
-                        breeze_text_buffer += token
-                        text_chunks, breeze_text_buffer = self._take_breeze_text(
-                            breeze_text_buffer
+                        audio_cpp_text_buffer += token
+                        text_chunks, audio_cpp_text_buffer = self._take_audio_cpp_text(
+                            audio_cpp_text_buffer
                         )
 
                         for chunk in text_chunks:
+                            tts_chunk = sanitize_tts_text(chunk).strip()
+                            if not tts_chunk:
+                                continue
                             self._log(
-                                f"Breeze text chunk: {chunk[:120]}"
+                                f"audio.cpp text chunk: {tts_chunk[:120]}"
                             )
-                            await breeze.send_text(chunk)
+                            await audio_cpp.send_text(tts_chunk)
 
                     # Flush the final partial phrase, but only after Qwen is
                     # finished. At this point even the final short phrase is
                     # a complete response fragment.
-                    final_chunks, breeze_text_buffer = self._take_breeze_text(
-                        breeze_text_buffer,
+                    final_chunks, audio_cpp_text_buffer = self._take_audio_cpp_text(
+                        audio_cpp_text_buffer,
                         force=True,
                     )
                     for chunk in final_chunks:
+                        tts_chunk = sanitize_tts_text(chunk).strip()
+                        if not tts_chunk:
+                            continue
                         self._log(
-                            f"Breeze final text chunk: {chunk[:120]}"
+                            f"audio.cpp final text chunk: {tts_chunk[:120]}"
                         )
-                        await breeze.send_text(chunk)
+                        await audio_cpp.send_text(tts_chunk)
 
                     response = "".join(response_parts).strip()
+                    diagnostics.set_text(response)
 
                     self._log(
                         f"LLM: {response[:160].replace(chr(10), ' ')}... "
@@ -581,14 +760,15 @@ class LiveVoiceAgent:
                         self._log("Empty LLM response", "WARN")
                         return
 
-                    # Flush remaining Breeze text and wait for all PCM.
-                    await breeze.end()
+                    # Flush remaining audio.cpp text and wait for all PCM.
+                    await audio_cpp.end()
                     await receiver_task
 
                     # Receiver has handed off all PCM; playback consumes it
                     # through the same stream, eliminating per-sentence
                     # open/close/play gaps.
                     await audio_queue.join()
+                    self._log(f"TTS diagnostics: {diagnostics.summary()}")
 
                 except asyncio.CancelledError:
                     receiver_task.cancel()
@@ -610,14 +790,15 @@ class LiveVoiceAgent:
             raise
         except Exception as exc:
             self._log(
-                f"LLM/Breeze streaming error: {exc}",
+                f"LLM/audio.cpp streaming error: {exc}",
                 "ERROR",
             )
         finally:
-            await audio_queue.join()
-
             if not playback_task.done():
-                await audio_queue.put(None)
+                try:
+                    await audio_queue.put(None)
+                except (asyncio.CancelledError, RuntimeError):
+                    pass
 
             await asyncio.gather(
                 playback_task,
@@ -768,7 +949,7 @@ class LiveVoiceAgent:
         print(f"  Capture:  {self._capture_rate} Hz")
         print(f"  STT:      Whisper (local)")
         print(f"  LLM:      Qwen3.6-35B (local)")
-        print(f"  TTS:      Breeze (local)")
+        print(f"  TTS:      audio.cpp (local)")
         print(f"  VAD:      threshold={self._vad_threshold}")
         print(f"  Silence:  {self._silence_duration_ms} ms")
         print(f"  Pre-roll: {self._pre_roll_ms} ms")
@@ -815,8 +996,19 @@ class LiveVoiceAgent:
             except Exception:
                 pass
 
+            # Cancel any active async tasks before closing the event loop.
+            # This prevents Python 3.14 from reporting "Task was destroyed while
+            # it is pending" and avoids websocket callbacks touching a closed loop.
             try:
-                loop.run_until_complete(asyncio.sleep(0))
+                pending = asyncio.all_tasks(loop)
+                current = asyncio.current_task(loop=loop)
+                for task in pending:
+                    if task is not current:
+                        task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
             except Exception:
                 pass
 
@@ -874,7 +1066,6 @@ def main() -> None:
         default=250,
         help="Audio retained before VAD triggers (default: 250)",
     )
-
     args = parser.parse_args()
 
     agent = LiveVoiceAgent(

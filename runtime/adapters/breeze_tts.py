@@ -20,6 +20,7 @@ Three generation modes (auto-detected from reference):
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import io
 import json
 import wave
@@ -319,7 +320,7 @@ class BreezeWSAdapter:
         base_url: str,
         ws_port: int = 0,  # 0 = auto-discover from /health
         instruction: str = "Speak clearly and naturally.",
-        cfg_scale: float = 1.0,
+        cfg_scale: float = 4.0,
         seed: int = 42,
         temperature: float | None = None,
         voice_id: str | None = None,
@@ -370,6 +371,23 @@ class BreezeWSAdapter:
         started_data = json.loads(started)
         if started_data.get("type") != "started":
             raise RuntimeError(f"Unexpected started message: {started_data}")
+
+    async def send_text(self, text: str) -> None:
+        """Append incremental text to the current Breeze session."""
+        if not text:
+            return
+        await self._ws.send(json.dumps({
+            "type": "text",
+            "text": text,
+        }))
+
+    async def end(self) -> None:
+        """Finish the current text input and ask the server to flush it."""
+        await self._ws.send(json.dumps({"type": "end"}))
+
+    async def receive(self) -> bytes | str:
+        """Receive one raw WebSocket message from the current session."""
+        return await self._ws.recv()
 
     async def close(self) -> None:
         """Cancel and close the session."""
@@ -699,6 +717,20 @@ class BreezeTTS:
         )
 
     # ---- Public API (WebSocket mode) --------------------------------------
+
+    @asynccontextmanager
+    async def persistent_session(self) -> AsyncIterator[BreezeWSAdapter]:
+        """Keep one Breeze WebSocket session open for one streamed response."""
+        if self._mode != "websocket" or self._ws is None:
+            raise RuntimeError(
+                "persistent_session requires BreezeTTS websocket mode"
+            )
+
+        await self._ws.connect()
+        try:
+            yield self._ws
+        finally:
+            await self._ws.close()
 
     async def speak(
         self,
