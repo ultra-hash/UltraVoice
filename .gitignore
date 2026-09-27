@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Audio files (test outputs / samples)
+*.wav
+*.pcm
+*.mp3
+*.ogg
+*.flac
+breeze_test.wav
+breeze_test.pcm
+pipeline_output.wav
+pipeline_test*.wav
+test_*.wav
+pipeline_*.wav
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node (if used for frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints
+
+# ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
